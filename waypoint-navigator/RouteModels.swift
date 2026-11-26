@@ -1,5 +1,45 @@
 import MapKit
 
+/// The locally saved form of a route being assembled in the map editor.
+struct SavedWaypoint: Codable {
+    let latitude: Double
+    let longitude: Double
+
+    init(coordinate: CLLocationCoordinate2D) {
+        latitude = coordinate.latitude
+        longitude = coordinate.longitude
+    }
+}
+
+struct SavedRoute: Codable, Identifiable {
+    let id: UUID
+    var name: String
+    let savedAt: Date
+    let waypoints: [SavedWaypoint]
+
+    init(name: String, waypoints: [MapWaypoint]) {
+        id = UUID()
+        self.name = name
+        savedAt = Date()
+        self.waypoints = waypoints.map { SavedWaypoint(coordinate: $0.coordinate) }
+    }
+}
+
+/// Small local JSON store for routes finalized in the current prototype.
+enum SavedRouteStore {
+    private static var fileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("saved-routes.json")
+    }
+
+    static func append(_ route: SavedRoute) throws {
+        let routes = (try? JSONDecoder().decode([SavedRoute].self, from: Data(contentsOf: fileURL))) ?? []
+        let updatedRoutes = routes + [route]
+        let data = try JSONEncoder().encode(updatedRoutes)
+        try data.write(to: fileURL, options: .atomic)
+    }
+}
+
 /// One tapped point on the map.
 /// (Named MapWaypoint so it cannot clash with a Waypoint type in NavigationCore.)
 struct MapWaypoint: Identifiable {

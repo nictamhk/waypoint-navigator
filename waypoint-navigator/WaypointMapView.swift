@@ -6,6 +6,9 @@ struct WaypointMapView: View {
     @State private var routeViewModel = RouteViewModel()
     @State private var cameraPosition: MapCameraPosition = .automatic
     @State private var hasCentredOnUser = false
+    @State private var isEditingWaypoints = false
+    @State private var isShowingSavePrompt = false
+    @State private var saveRouteName = ""
 
     @Environment(\.openURL) private var openURL
 
@@ -26,7 +29,7 @@ struct WaypointMapView: View {
 
                 // Waypoint markers: START, numbered stops, END
                 ForEach(waypoints) { waypoint in
-                    Annotation("", coordinate: waypoint.coordinate) {
+                    Annotation("", coordinate: routeViewModel.displayedCoordinate(for: waypoint)) {
                         WaypointMarker(kind: routeViewModel.markerKind(for: waypoint))
                             .onTapGesture {
                                 routeViewModel.removeWaypoint(waypoint)
@@ -45,22 +48,8 @@ struct WaypointMapView: View {
         .overlay(alignment: .top) {
             statusPanel(waypointCount: waypoints.count, lastWaypoint: waypoints.last)
         }
-        .overlay(alignment: .bottom) {
-            VStack(spacing: 10) {
-                if let message = routeViewModel.errorMessage {
-                    errorBanner(message)
-                }
-                if locationManager.isDenied {
-                    permissionDeniedBanner
-                }
-                if !waypoints.isEmpty {
-                    Button("Clear all", role: .destructive) {
-                        routeViewModel.removeAll()
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-            }
-            .padding()
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            waypointPanel(waypoints: waypoints)
         }
         .task {
             locationManager.start()
@@ -70,6 +59,15 @@ struct WaypointMapView: View {
         }
         .onChange(of: locationManager.hasFix) { _, hasFix in
             centreOnUserOnce(hasFix: hasFix)
+        }
+        .alert("Save route", isPresented: $isShowingSavePrompt) {
+            TextField("Route name", text: $saveRouteName)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") {
+                routeViewModel.saveRoute(named: saveRouteName)
+            }
+        } message: {
+            Text("Save this waypoint order on this iPhone.")
         }
     }
 
@@ -121,6 +119,127 @@ struct WaypointMapView: View {
         .padding(.vertical, 8)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
         .padding(.top, 8)
+    }
+
+    private func waypointPanel(waypoints: [MapWaypoint]) -> some View {
+        VStack(spacing: 0) {
+            if !waypoints.isEmpty {
+                HStack {
+                    Text("Waypoints · \(waypoints.count)")
+                        .font(.headline)
+                    Spacer()
+                    Button(isEditingWaypoints ? "Done" : "Reorder") {
+                        withAnimation { isEditingWaypoints.toggle() }
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .disabled(waypoints.count < 2)
+                }
+                .padding(.horizontal)
+                .padding(.top, 10)
+                .padding(.bottom, 4)
+
+                List {
+                    ForEach(Array(waypoints.enumerated()), id: \.element.id) { index, waypoint in
+                        waypointRow(waypoint, index: index, count: waypoints.count)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14))
+                            .listRowBackground(Color.clear)
+                    }
+                    .onMove { source, destination in
+                        routeViewModel.moveWaypoints(from: source, to: destination)
+                    }
+                    .onDelete(perform: routeViewModel.removeWaypoints(at:))
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .environment(\.editMode, .constant(isEditingWaypoints ? .active : .inactive))
+                .frame(height: min(CGFloat(waypoints.count) * 58, 232))
+
+                HStack(spacing: 12) {
+                    if routeViewModel.hasCompleteRoute {
+                        Text("Total · \(formattedDuration(routeViewModel.totalTravelTime))")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    } else if routeViewModel.isCalculating {
+                        ProgressView().controlSize(.small)
+                        Text("Estimating…")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    Button {
+                        saveRouteName = "Route \(Date.now.formatted(date: .abbreviated, time: .shortened))"
+                        isShowingSavePrompt = true
+                    } label: {
+                        Label("Save", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!routeViewModel.hasCompleteRoute)
+
+                    Button("Clear", role: .destructive) {
+                        routeViewModel.removeAll()
+                        isEditingWaypoints = false
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 9)
+
+                if let message = routeViewModel.saveMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(message.hasPrefix("Could not") ? .red : .secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal)
+                        .padding(.bottom, 6)
+                }
+            }
+
+            if let message = routeViewModel.errorMessage {
+                errorBanner(message)
+                    .padding(.horizontal)
+                    .padding(.vertical, 6)
+            }
+            if locationManager.isDenied {
+                permissionDeniedBanner
+                    .padding(.horizontal)
+                    .padding(.vertical, 6)
+            }
+        }
+        .background(.regularMaterial)
+    }
+
+    private func waypointRow(_ waypoint: MapWaypoint, index: Int, count: Int) -> some View {
+        HStack(spacing: 10) {
+            WaypointMarker(kind: routeViewModel.markerKind(for: waypoint))
+                .scaleEffect(0.78)
+                .frame(width: 30, height: 34)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(waypointTitle(at: index, count: count))
+                    .font(.subheadline.weight(.medium))
+                Text(String(format: "%.5f, %.5f", waypoint.coordinate.latitude, waypoint.coordinate.longitude))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(index == 0 ? "Start" : routeViewModel.estimatedLegTime(at: index).map { "Leg · \(formattedDuration($0))" } ?? "Leg · pending")
+                    .font(.subheadline)
+                Text("ETA · \(routeViewModel.estimatedArrival(at: index)?.formatted(date: .omitted, time: .shortened) ?? "pending")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func waypointTitle(at index: Int, count: Int) -> String {
+        if index == 0 { return "Start" }
+        if index == count - 1 { return "Terminus" }
+        return "Stop \(index)"
     }
 
     private func errorBanner(_ message: String) -> some View {
