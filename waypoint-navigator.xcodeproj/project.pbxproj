@@ -31,6 +31,7 @@
 		9504DEC230B1EE2A00E18C1C /* waypoint-navigator.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "waypoint-navigator.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		9504DECF30B1EE2D00E18C1C /* waypoint-navigatorTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "waypoint-navigatorTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		9504DED930B1EE2D00E18C1C /* waypoint-navigatorUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "waypoint-navigatorUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		9504DF3930B92E0500E18C1C /* waypoint-navigator.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; path = "waypoint-navigator.xcodeproj"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -94,6 +95,11 @@
 				9504DECF30B1EE2D00E18C1C /* waypoint-navigatorTests.xctest */,
 				9504DED930B1EE2D00E18C1C /* waypoint-navigatorUITests.xctest */,
 			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		9504DF3B30B92E0500E18C1C /* Products */ = {
+			isa = PBXGroup;
 			name = Products;
 			sourceTree = "<group>";
 		};
@@ -207,6 +213,12 @@
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9504DEC330B1EE2A00E18C1C /* Products */;
 			projectDirPath = "";
+			projectReferences = (
+				{
+					ProductGroup = 9504DF3B30B92E0500E18C1C /* Products */;
+					ProjectRef = 9504DF3930B92E0500E18C1C /* waypoint-navigator.xcodeproj */;
+				},
+			);
 			projectRoot = "";
 			targets = (
 				9504DEC130B1EE2A00E18C1C /* waypoint-navigator */,
@@ -407,6 +419,7 @@
 				DEVELOPMENT_TEAM = TUAYQRNG94;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Waypoint Navigator uses your location to set the route starting point and show your position on the map.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -439,6 +452,7 @@
 				DEVELOPMENT_TEAM = TUAYQRNG94;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Waypoint Navigator uses your location to set the route starting point and show your position on the map.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
