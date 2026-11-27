@@ -3,8 +3,13 @@ import MapKit
 /// One tapped point on the map.
 /// (Named MapWaypoint so it cannot clash with a Waypoint type in NavigationCore.)
 struct MapWaypoint: Identifiable {
-    let id = UUID()
+    let id: UUID
     let coordinate: CLLocationCoordinate2D
+
+    init(id: UUID = UUID(), coordinate: CLLocationCoordinate2D) {
+        self.id = id
+        self.coordinate = coordinate
+    }
 }
 
 /// Identifies one leg of the route: "from this waypoint to that waypoint".

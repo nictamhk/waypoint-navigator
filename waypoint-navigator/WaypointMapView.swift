@@ -3,7 +3,7 @@ import MapKit
 
 struct WaypointMapView: View {
     @State private var locationManager = LocationManager()
-    @State private var routeViewModel = RouteViewModel()
+    @State var routeViewModel: RouteViewModel
     @State private var cameraPosition: MapCameraPosition = .automatic
     @State private var hasCentredOnUser = false
 
@@ -58,6 +58,10 @@ struct WaypointMapView: View {
                         routeViewModel.removeAll()
                     }
                     .buttonStyle(.borderedProminent)
+                    Button("Save as New Route") {
+                        routeViewModel.saveAsNewRoute()
+                    }
+                    .buttonStyle(.bordered)
                 }
             }
             .padding()
@@ -97,6 +101,10 @@ struct WaypointMapView: View {
         VStack(spacing: 4) {
             Text("Waypoints: \(waypointCount)")
                 .font(.headline)
+
+            if let routeNumber = routeViewModel.routeNumber {
+                Text("Route \(routeNumber)").font(.caption).foregroundStyle(.secondary)
+            }
 
             if routeViewModel.hasCompleteRoute {
                 Text("\(formattedDistance(routeViewModel.totalDistance)) · \(formattedDuration(routeViewModel.totalTravelTime))")

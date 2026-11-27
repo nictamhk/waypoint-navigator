@@ -9,6 +9,8 @@ final class RouteViewModel {
 
     private(set) var waypoints: [MapWaypoint] = []
     private(set) var errorMessage: String?
+    private(set) var routeNumber: String?
+    private var routeID: UUID?
 
     /// Legs already fetched, so adding one waypoint only requests one new leg.
     private var legCache: [LegKey: DrivingLeg] = [:]
@@ -49,18 +51,40 @@ final class RouteViewModel {
     func addWaypoint(at coordinate: CLLocationCoordinate2D) {
         waypoints.append(MapWaypoint(coordinate: coordinate))
         errorMessage = nil
+        persist()
     }
 
     func removeWaypoint(_ waypoint: MapWaypoint) {
         waypoints.removeAll { $0.id == waypoint.id }
         legCache = legCache.filter { $0.key.from != waypoint.id && $0.key.to != waypoint.id }
         errorMessage = nil
+        persist()
     }
 
     func removeAll() {
         waypoints.removeAll()
         legCache.removeAll()
         errorMessage = nil
+        persist()
+    }
+
+    func loadPreset(_ id: UUID) {
+        guard let saved = RouteDatabase.shared.loadRoute(id: id) else { return }
+        routeID = saved.id
+        routeNumber = saved.number
+        waypoints = saved.waypoints.map {
+            MapWaypoint(id: $0.0, coordinate: CLLocationCoordinate2D(latitude: $0.1, longitude: $0.2))
+        }
+        legCache.removeAll()
+        errorMessage = nil
+    }
+
+    func saveAsNewRoute() {
+        routeID = nil
+        routeNumber = nil
+        waypoints = waypoints.map { MapWaypoint(coordinate: $0.coordinate) }
+        legCache.removeAll()
+        persist()
     }
 
     // MARK: - Route calculation
@@ -85,6 +109,7 @@ final class RouteViewModel {
             }
             if Task.isCancelled { return }
         }
+        persist()
     }
 
     private func fetchLeg(from start: MapWaypoint, to end: MapWaypoint) async throws -> DrivingLeg {
@@ -104,6 +129,18 @@ final class RouteViewModel {
             distance: route.distance,
             travelTime: route.expectedTravelTime
         )
+    }
+
+    private func persist() {
+        let points = waypoints.map { ($0.id, $0.coordinate.latitude, $0.coordinate.longitude, "") }
+        let durations = legs.map { ($0.key.from, $0.key.to, $0.travelTime) }
+        do {
+            let saved = try RouteDatabase.shared.save(waypoints: points, legs: durations, routeID: routeID, routeNumber: routeNumber)
+            routeID = saved.0
+            routeNumber = saved.1
+        } catch {
+            errorMessage = "Could not save route: \(error.localizedDescription)"
+        }
     }
 
     private func message(for error: Error) -> String {

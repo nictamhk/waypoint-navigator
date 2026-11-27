@@ -27,8 +27,27 @@ struct ContentView: View {
 
 
 struct ContentView: View {
+    @State private var routeViewModel = RouteViewModel()
+    @State private var selectedTab = 0
+
     var body: some View {
-        WaypointMapView()
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                WaypointMapView(routeViewModel: routeViewModel)
+            }
+            .tabItem { Label("Map", systemImage: "map") }
+            .tag(0)
+
+            NavigationStack {
+                RouteLibraryView { id in
+                    routeViewModel.loadPreset(id)
+                    selectedTab = 0
+                }
+                    .navigationTitle("Load Preset")
+            }
+            .tabItem { Label("Load Preset", systemImage: "tray.full") }
+            .tag(1)
+        }
     }
 }
 
