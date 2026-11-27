@@ -6,6 +6,9 @@ struct RouteLibraryView: View {
 
     @State private var routes: [SavedRoute] = []
     @State private var loadError: String?
+    @State private var deleteError: String?
+    @State private var routePendingDeletion: SavedRoute?
+    @State private var isConfirmingDelete = false
 
     var body: some View {
         NavigationStack {
@@ -17,10 +20,19 @@ struct RouteLibraryView: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 12) {
+                            if let deleteError {
+                                Text(deleteError)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
                             ForEach(routes) { route in
                                 SavedRouteCard(route: route) {
                                     onLoad(route)
                                     dismiss()
+                                } onDelete: {
+                                    routePendingDeletion = route
+                                    isConfirmingDelete = true
                                 }
                             }
                         }
@@ -35,22 +47,42 @@ struct RouteLibraryView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .alert("Delete Route", isPresented: $isConfirmingDelete, presenting: routePendingDeletion) { route in
+                Button("Delete", role: .destructive) { delete(route) }
+                Button("Cancel", role: .cancel) { routePendingDeletion = nil }
+            } message: { route in
+                Text("Delete route \(route.routeNumber), \(route.name)? This cannot be undone.")
+            }
             .task { reloadRoutes() }
         }
     }
 
     private func reloadRoutes() {
         do {
-            routes = try SavedRouteStore.loadAll().sorted { $0.savedAt > $1.savedAt }
+            routes = SavedRouteStore.sortedByRouteNumber(try SavedRouteStore.loadAll())
         } catch {
             loadError = "Could not read saved routes: \(error.localizedDescription)"
         }
     }
+
+    private func delete(_ route: SavedRoute) {
+        do {
+            try SavedRouteStore.delete(id: route.id)
+            routes.removeAll { $0.id == route.id }
+            routePendingDeletion = nil
+            deleteError = nil
+        } catch {
+            deleteError = "Could not delete route: \(error.localizedDescription)"
+            routePendingDeletion = nil
+        }
+    }
+
 }
 
 struct SavedRouteCard: View {
     let route: SavedRoute
     let onLoad: () -> Void
+    let onDelete: () -> Void
 
     private var totalTravelTime: TimeInterval {
         route.waypoints.compactMap(\.travelTimeFromPrevious).reduce(0, +)
@@ -71,6 +103,12 @@ struct SavedRouteCard: View {
                     .font(.headline)
                     .lineLimit(1)
                 Spacer(minLength: 0)
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Delete route \(route.routeNumber)")
             }
 
             if route.polyline.count >= 2 {

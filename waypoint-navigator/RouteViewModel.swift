@@ -1,5 +1,7 @@
 import MapKit
 import Observation
+import NavigationCore
+import CoreLocation
 
 /// Holds the waypoints and the driving legs between them.
 /// Asks Apple Maps for one leg at a time, and remembers legs it has already fetched.
@@ -17,6 +19,8 @@ final class RouteViewModel {
     private var legCache: [LegKey: DrivingLeg] = [:]
     private var hasSetDefaultStart = false
     private var avoidHighwaysForCurrentRoute = false
+    private let osmFeatureProvider = OSMFeatureProvider()
+    private let addressResolver = AddressResolver()
     private var routingRevision = 0
     private var cacheGeneration = 0
 
@@ -133,12 +137,44 @@ final class RouteViewModel {
         isRefreshingSavedRoute = false
     }
 
-    func addWaypoint(at coordinate: CLLocationCoordinate2D, title: String? = nil) {
-        waypoints.append(MapWaypoint(coordinate: coordinate, title: title))
+    @discardableResult
+    func addWaypoint(at coordinate: CLLocationCoordinate2D, title: String? = nil) -> UUID {
+        let id = UUID()
+        let initialTitle = title ?? "Stop \(waypoints.count)"
+        waypoints.append(MapWaypoint(id: id, coordinate: coordinate, title: initialTitle))
         errorMessage = nil
         saveMessage = nil
         savedRoute = nil
         isRefreshingSavedRoute = false
+        return id
+    }
+
+    func resolveWaypointName(id: UUID, fallback: String) async {
+        guard let initial = waypoints.first(where: { $0.id == id }) else { return }
+        let initialTitle = initial.title
+        let resolvedName = await suggestedStopName(at: initial.coordinate)
+        guard let current = waypoints.first(where: { $0.id == id }), current.title == initialTitle else { return }
+        renameWaypoint(id: id, title: resolvedName ?? fallback)
+    }
+
+    func suggestedStopName(at coordinate: CLLocationCoordinate2D) async -> String? {
+        if let name = try? await osmFeatureProvider.stopName(near: GeoCoordinate(coordinate)) { return name }
+        return await reverseGeocodedAddress(at: coordinate)
+    }
+
+    private func reverseGeocodedAddress(at coordinate: CLLocationCoordinate2D) async -> String? {
+        await addressResolver.address(at: coordinate)
+    }
+
+    func renameWaypoint(id: UUID, title: String) {
+        guard let index = waypoints.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = waypoints[index].title ?? "Stop \(index)"
+        waypoints[index] = MapWaypoint(
+            id: waypoints[index].id,
+            coordinate: waypoints[index].coordinate,
+            title: trimmed.isEmpty ? fallback : trimmed
+        )
     }
 
     func moveWaypoints(from source: IndexSet, to destination: Int) {
@@ -169,8 +205,10 @@ final class RouteViewModel {
         isRefreshingSavedRoute = false
     }
 
-    /// Rebuilds the route shape from an origin and destination, then places stops at regular
-    /// distance intervals along the returned drivable geometry.
+    /// Builds a drivable corridor, fetches nearby OSM features, places stops along it, then names them:
+    /// OSM name first, otherwise a reverse-geocoded address. Titles are made unique within the route.
+    /// The interval is a minimum spacing: stops only go at real features, so a rural road may have long gaps.
+    /// If the OSM server cannot be reached at all, stops are placed at the interval and named from addresses.
     func generateAutomaticRoute(from origin: CLLocationCoordinate2D,
                                 to destination: CLLocationCoordinate2D,
                                 destinationTitle: String?,
@@ -197,47 +235,47 @@ final class RouteViewModel {
                 throw RouteError.noRouteFound
             }
             let coordinates = Self.coordinates(in: route.polyline)
-            let segmentLengths = zip(coordinates, coordinates.dropFirst()).map { first, second in
-                CLLocation(latitude: first.latitude, longitude: first.longitude)
-                    .distance(from: CLLocation(latitude: second.latitude, longitude: second.longitude))
-            }
-            let routeLength = segmentLengths.reduce(0, +)
-            guard routeLength > 0, coordinates.count >= 2 else {
+            guard coordinates.count >= 2 else {
                 throw RouteError.noRouteFound
             }
 
-            // Keep at most 49 stops after the start (including the destination).
-            // Round an adjusted interval up to 100 m so it can be shown clearly in the picker.
-            let minimumIntervalForStopLimit = ceil((routeLength / 49) / 100) * 100
-            let effectiveStopInterval = max(stopInterval, minimumIntervalForStopLimit)
+            let geometry = RouteGeometry(
+                vertices: coordinates.map { GeoCoordinate(latitude: $0.latitude, longitude: $0.longitude) },
+                legEndVertexIndices: []
+            )
+            guard geometry.totalLength > 0 else { throw RouteError.noRouteFound }
 
-            var generated = [MapWaypoint(coordinate: origin, title: "Current Location")]
-            var targetDistance = effectiveStopInterval
-            var segmentIndex = 0
-            var segmentStartDistance = 0.0
-            var stopNumber = 1
-
-            while targetDistance < routeLength {
-                while segmentIndex < segmentLengths.count - 1,
-                      segmentStartDistance + segmentLengths[segmentIndex] < targetDistance {
-                    segmentStartDistance += segmentLengths[segmentIndex]
-                    segmentIndex += 1
+            saveMessage = "Loading nearby OSM stops and highway features…"
+            var features: [StopFeature] = []
+            var highwayWays: [HighwayWay] = []
+            var notes: [String] = []
+            var onlineDataFailed = false
+            do {
+                let osm = try await osmFeatureProvider.features(for: geometry)
+                features = osm.features
+                highwayWays = osm.highwayWays
+                if !osm.degradedRanges.isEmpty {
+                    notes.append("Online place data was unavailable for part of this route, so that stretch may have fewer stops.")
                 }
-                let segmentLength = segmentLengths[segmentIndex]
-                if segmentLength > 0 {
-                    let fraction = (targetDistance - segmentStartDistance) / segmentLength
-                    let start = coordinates[segmentIndex]
-                    let end = coordinates[segmentIndex + 1]
-                    let stopCoordinate = CLLocationCoordinate2D(
-                        latitude: start.latitude + (end.latitude - start.latitude) * fraction,
-                        longitude: start.longitude + (end.longitude - start.longitude) * fraction
-                    )
-                    generated.append(MapWaypoint(coordinate: stopCoordinate, title: "Stop \(stopNumber)"))
-                    stopNumber += 1
-                }
-                targetDistance += effectiveStopInterval
+            } catch {
+                if Task.isCancelled { return nil }
+                onlineDataFailed = true
+                notes.append("Online place data was unavailable, so stops are placed at the interval and named from addresses.")
             }
-            generated.append(MapWaypoint(coordinate: destination, title: destinationTitle ?? "Destination"))
+            guard !Task.isCancelled else { return nil }
+
+            let placement = StopPlacementService.generate(
+                geometry: geometry,
+                interval: stopInterval,
+                features: features,
+                highwayWays: highwayWays,
+                expressMode: expressMode,
+                addressFallback: onlineDataFailed
+            )
+
+            guard let generated = await makeWaypoints(from: placement.stops, origin: origin,
+                                                      destination: destination,
+                                                      destinationTitle: destinationTitle) else { return nil }
 
             waypoints = generated
             cacheGeneration += 1
@@ -247,8 +285,18 @@ final class RouteViewModel {
             isRefreshingSavedRoute = false
             hasSetDefaultStart = true
             avoidHighwaysForCurrentRoute = !expressMode
-            saveMessage = "Generated \(max(generated.count - 1, 0)) stops after the start. Calculating estimates…"
-            return effectiveStopInterval
+
+            var message = "Generated \(max(generated.count - 2, 0)) stops"
+            if placement.wasAdjusted {
+                message += ". Minimum spacing adjusted from \(Self.formatDistance(placement.requestedInterval)) to "
+                    + "\(Self.formatDistance(placement.effectiveInterval)) to stay within "
+                    + "\(StopPlacementService.targetStops) stops."
+            } else {
+                message += " with at least \(Self.formatDistance(placement.effectiveInterval)) between stops."
+            }
+            if !notes.isEmpty { message += " " + notes.joined(separator: " ") }
+            saveMessage = message + " Calculating estimates…"
+            return placement.effectiveInterval
         } catch {
             if Task.isCancelled { return nil }
             errorMessage = "Could not generate route: \(error.localizedDescription)"
@@ -257,13 +305,75 @@ final class RouteViewModel {
         }
     }
 
+    /// Turns placed stops into waypoints.
+    /// - Origin keeps "Current Location"; the destination uses the given title, else an OSM/address name.
+    /// - Feature names follow StopPlacementService's priority (bus stop, cross street, landmark, exit).
+    /// - Unnamed stops are reverse-geocoded; if that fails they remain as "Stop X".
+    /// - Finally titles are made unique (later duplicates get a km marker).
+    private func makeWaypoints(from placed: [PlacedStop],
+                               origin: CLLocationCoordinate2D,
+                               destination: CLLocationCoordinate2D,
+                               destinationTitle: String?) async -> [MapWaypoint]? {
+        struct Draft {
+            var title: String?
+            var names: [String: String]
+            var coordinate: CLLocationCoordinate2D
+            var chainage: Double
+        }
+        var drafts: [Draft] = []
+        let addressCount = placed.dropFirst().dropLast().count
+        var addressesDone = 0
+
+        for (index, stop) in placed.enumerated() {
+            let coordinate = CLLocationCoordinate2D(latitude: stop.coordinate.latitude,
+                                                    longitude: stop.coordinate.longitude)
+            if index == 0 {
+                drafts.append(Draft(title: "Current Location", names: [:], coordinate: origin, chainage: stop.chainage))
+            } else if index == placed.count - 1 {
+                var title = destinationTitle
+                if title == nil { title = await suggestedStopName(at: destination) }
+                guard !Task.isCancelled else { return nil }
+                drafts.append(Draft(title: title ?? "Destination", names: [:], coordinate: destination,
+                                    chainage: stop.chainage))
+            } else {
+                addressesDone += 1
+                saveMessage = "Naming stops (\(addressesDone) of \(addressCount))…"
+                var title = StopNaming.title(name: stop.name, detail: stop.detail)
+                if title == nil {
+                    title = await addressResolver.address(at: coordinate)
+                }
+                guard !Task.isCancelled else { return nil }
+                drafts.append(Draft(title: title,
+                                    names: stop.names, coordinate: coordinate, chainage: stop.chainage))
+            }
+        }
+
+        var items: [(title: String, chainage: Double)] = []
+        for (index, draft) in drafts.enumerated() {
+            items.append((title: draft.title ?? "Stop \(index)", chainage: draft.chainage))
+        }
+        let titles = StopNaming.makeUnique(items)
+        return drafts.enumerated().map { index, draft in
+            // If a title had to be changed to stay unique, drop the per-language names so announcements
+            // use the unique title instead of repeating the same name twice.
+            let changed = titles[index] != items[index].title
+            return MapWaypoint(coordinate: draft.coordinate, title: titles[index],
+                               names: changed ? [:] : draft.names)
+        }
+    }
+
+    private static func formatDistance(_ meters: Double) -> String {
+        meters >= 1_000 ? String(format: "%.1f km", meters / 1_000) : "\(Int(meters.rounded())) m"
+    }
+
     func loadSavedRoute(_ route: SavedRoute) {
         avoidHighwaysForCurrentRoute = false
         waypoints = route.waypoints.map {
             MapWaypoint(
                 id: $0.id,
                 coordinate: CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude),
-                title: $0.title
+                title: $0.title,
+                names: $0.names
             )
         }
         routingRevision += 1
@@ -298,7 +408,8 @@ final class RouteViewModel {
                 coordinate: waypoint.coordinate,
                 title: waypoint.title,
                 travelTimeFromPrevious: legTime,
-                estimatedArrival: departure.addingTimeInterval(elapsed)
+                estimatedArrival: departure.addingTimeInterval(elapsed),
+                names: waypoint.names
             ))
         }
 

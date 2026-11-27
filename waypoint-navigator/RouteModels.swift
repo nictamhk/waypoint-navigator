@@ -9,19 +9,24 @@ struct SavedWaypoint: Codable {
     /// Estimated drive time from the previous waypoint; nil for the route origin.
     let travelTimeFromPrevious: TimeInterval?
     let estimatedArrival: Date?
+    /// Language code -> stop name, for bilingual announcements. "default" is the untagged name.
+    /// Empty for routes saved before this field existed, and for stops the user renamed.
+    let names: [String: String]
 
     init(id: UUID, coordinate: CLLocationCoordinate2D, title: String?,
-         travelTimeFromPrevious: TimeInterval?, estimatedArrival: Date?) {
+         travelTimeFromPrevious: TimeInterval?, estimatedArrival: Date?,
+         names: [String: String] = [:]) {
         self.id = id
         latitude = coordinate.latitude
         longitude = coordinate.longitude
         self.title = title
         self.travelTimeFromPrevious = travelTimeFromPrevious
         self.estimatedArrival = estimatedArrival
+        self.names = names
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, latitude, longitude, title, travelTimeFromPrevious, estimatedArrival
+        case id, latitude, longitude, title, travelTimeFromPrevious, estimatedArrival, names
     }
 
     init(from decoder: Decoder) throws {
@@ -32,6 +37,7 @@ struct SavedWaypoint: Codable {
         title = try values.decodeIfPresent(String.self, forKey: .title)
         travelTimeFromPrevious = try values.decodeIfPresent(TimeInterval.self, forKey: .travelTimeFromPrevious)
         estimatedArrival = try values.decodeIfPresent(Date.self, forKey: .estimatedArrival)
+        names = try values.decodeIfPresent([String: String].self, forKey: .names) ?? [:]
     }
 }
 
@@ -108,6 +114,23 @@ enum SavedRouteStore {
         let data = try JSONEncoder().encode(updatedRoutes)
         try data.write(to: fileURL, options: .atomic)
     }
+
+    static func delete(id: UUID) throws {
+        let updatedRoutes = try loadAll().filter { $0.id != id }
+        let data = try JSONEncoder().encode(updatedRoutes)
+        try data.write(to: fileURL, options: .atomic)
+    }
+
+    static func sortedByRouteNumber(_ routes: [SavedRoute]) -> [SavedRoute] {
+        routes.sorted { lhs, rhs in
+            let lhsNumber = Int(String(lhs.routeNumber.filter(\.isNumber))) ?? Int.max
+            let rhsNumber = Int(String(rhs.routeNumber.filter(\.isNumber))) ?? Int.max
+            if lhsNumber != rhsNumber { return lhsNumber < rhsNumber }
+            let numberOrder = lhs.routeNumber.localizedStandardCompare(rhs.routeNumber)
+            if numberOrder != .orderedSame { return numberOrder == .orderedAscending }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+    }
 }
 
 /// One tapped point on the map.
@@ -116,11 +139,16 @@ struct MapWaypoint: Identifiable {
     let id: UUID
     let coordinate: CLLocationCoordinate2D
     let title: String?
+    /// Language code -> stop name ("default" = untagged name), filled for automatically generated stops.
+    /// Renaming a stop by hand clears it, because the typed title then replaces every language.
+    let names: [String: String]
 
-    init(id: UUID = UUID(), coordinate: CLLocationCoordinate2D, title: String? = nil) {
+    init(id: UUID = UUID(), coordinate: CLLocationCoordinate2D, title: String? = nil,
+         names: [String: String] = [:]) {
         self.id = id
         self.coordinate = coordinate
         self.title = title
+        self.names = names
     }
 }
 
