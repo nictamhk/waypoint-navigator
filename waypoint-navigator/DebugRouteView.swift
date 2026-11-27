@@ -56,7 +56,12 @@ struct DebugRouteView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text(model.status).font(.footnote)
                 HStack {
-                    Stepper("Test stops: \(model.interiorStopCount)", value: $model.interiorStopCount, in: 0...12)
+                    Picker("Automatic stop interval", selection: $model.automaticStopInterval) {
+                        Text("200 m").tag(200.0)
+                        Text("300 m").tag(300.0)
+                        Text("500 m").tag(500.0)
+                        Text("1 km").tag(1000.0)
+                    }
                     Button("Build") { Task { await model.build() } }
                         .buttonStyle(.borderedProminent)
                         .disabled(!model.canBuild)
