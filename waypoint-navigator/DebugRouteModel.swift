@@ -23,6 +23,7 @@ final class DebugRouteModel {
     var origin: GeoCoordinate?
     var destination: GeoCoordinate?
     var interiorStopCount = 4
+    var automaticStopInterval = 500.0
     var snapshot: RouteSnapshot?
     var status = "Tap the map to set the origin, then the destination."
     var isBuilding = false
@@ -42,6 +43,7 @@ final class DebugRouteModel {
     var rejectedCount = 0
 
     private let manager: RouteManager
+    private let osmProvider = OSMFeatureProvider()
     private var service: RouteMatchingService?
     private var driveTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
@@ -86,16 +88,25 @@ final class DebugRouteModel {
             status = "Fetching corridor route..."
             let corridor = try await manager.buildSnapshot(waypoints: [start, end], plannedDeparture: departure)
 
-            var waypoints = [start]
-            let count = interiorStopCount
-            for k in stride(from: 1, through: count, by: 1) {
-                let chainage = corridor.geometry.totalLength * Double(k) / Double(count + 1)
-                waypoints.append(Waypoint(
-                    coordinate: corridor.geometry.coordinate(atChainage: chainage),
-                    name: LocalizedText("Stop \(k)", language: "en"),
-                    source: .generated))
+            status = "Loading OSM stop and highway features..."
+            let osm = try await osmProvider.features(for: corridor.geometry)
+            let placement = StopPlacementService.generate(
+                geometry: corridor.geometry,
+                interval: automaticStopInterval,
+                features: osm.features,
+                highwayWays: osm.highwayWays
+            )
+            let waypoints = placement.stops.enumerated().map { index, stop in
+                let isOrigin = index == 0
+                let isDestination = index == placement.stops.count - 1
+                let label = isOrigin ? "Origin" : (isDestination ? "Destination" : (stop.name ?? "Stop \(index)"))
+                return Waypoint(
+                    coordinate: stop.coordinate,
+                    name: LocalizedText(label, language: "en"),
+                    source: isOrigin ? .origin : (isDestination ? .destination : .generated),
+                    nameSource: stop.name == nil ? .placeholder : .landmark
+                )
             }
-            waypoints.append(end)
 
             status = "Fetching \(waypoints.count - 1) legs..."
             let result = try await manager.buildSnapshot(
@@ -106,7 +117,7 @@ final class DebugRouteModel {
             snapshot = result
             probeChainage = 0
             camera = Self.frame(result.geometry.vertices)
-            status = "Route \(Int(result.geometry.totalLength.rounded())) m, \(result.legs.count) legs."
+            status = "Route \(Int(result.geometry.totalLength.rounded())) m, \(result.stops.count - 2) automatic stops (\(Int(placement.effectiveInterval.rounded())) m interval)."
         } catch {
             status = "Failed: \(error)"
         }
