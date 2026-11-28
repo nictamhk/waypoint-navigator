@@ -153,6 +153,13 @@ public enum StopPlacementService {
                                    effectiveInterval: effective, requestedInterval: requested)
     }
 
+    /// Fraction of route chainage covered by Express Mode highway segments.
+    public static func highwayFraction(geometry: RouteGeometry, highwayWays: [HighwayWay]) -> Double {
+        guard geometry.totalLength > 0 else { return 0 }
+        let covered = highwaySegments(geometry, highwayWays).reduce(0.0) { $0 + ($1.end - $1.start) }
+        return min(covered / geometry.totalLength, 1)
+    }
+
     // MARK: - Candidate pool
 
     private struct Candidate {

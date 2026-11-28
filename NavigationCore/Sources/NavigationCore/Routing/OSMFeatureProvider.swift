@@ -29,14 +29,15 @@ public struct OSMFeatureProvider: Sendable {
     /// cross street. A value is used for every kind and is meant for `stopName(near:)`, where there is no
     /// real route.
     public func features(for geometry: RouteGeometry, corridorRadius: Double? = nil) async throws
-        -> (features: [StopFeature], highwayWays: [HighwayWay], degradedRanges: [ClosedRange<Double>]) {
-        guard geometry.vertices.count >= 2 else { return ([], [], []) }
+        -> (features: [StopFeature], highwayWays: [HighwayWay], degradedRanges: [ClosedRange<Double>], roads: [NamedRoad]) {
+        guard geometry.vertices.count >= 2 else { return ([], [], [], []) }
         let radii = corridorRadius.map { SearchRadii.uniform(max($0, 1)) } ?? SearchRadii.automatic
         let routeAware = corridorRadius == nil
         let chunks = Self.chunks(of: geometry.vertices)
 
         var features: [String: StopFeature] = [:]
         var ways: [String: HighwayWay] = [:]
+        var routeRoads: [String: NamedRoad] = [:]
         var degraded: [ClosedRange<Double>] = []
         var lastError: Error?
         var succeeded = 0
@@ -50,6 +51,7 @@ public struct OSMFeatureProvider: Sendable {
                 if fromNetwork { Self.storeResponse(data, for: query) }
                 for feature in parsed.features where features[feature.id] == nil { features[feature.id] = feature }
                 for way in parsed.ways where ways[way.id] == nil { ways[way.id] = way }
+                for road in parsed.roads where routeRoads[road.id] == nil { routeRoads[road.id] = road }
                 succeeded += 1
                 if fromNetwork, index < chunks.count - 1 { try await Task.sleep(nanoseconds: 1_000_000_000) }
             } catch {
@@ -61,7 +63,8 @@ public struct OSMFeatureProvider: Sendable {
         if succeeded == 0, let lastError { throw lastError }
         return (features.values.sorted { $0.id < $1.id },
                 ways.values.sorted { $0.id < $1.id },
-                degraded)
+                degraded,
+                routeRoads.values.sorted { $0.id < $1.id })
     }
 
     /// Returns the highest-priority named OSM stop feature near a manually added waypoint.
@@ -270,6 +273,7 @@ public struct OSMFeatureProvider: Sendable {
     }
 
     private struct RoadWay {
+        let id: String
         let highway: String
         let names: [String: String]
         let coordinates: [GeoCoordinate]
@@ -293,7 +297,7 @@ public struct OSMFeatureProvider: Sendable {
     }
 
     private static func parse(_ data: Data, chunk: RouteChunk, geometry: RouteGeometry, routeAware: Bool)
-        throws -> (features: [StopFeature], ways: [HighwayWay]) {
+        throws -> (features: [StopFeature], ways: [HighwayWay], roads: [NamedRoad]) {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let elements = root["elements"] as? [[String: Any]] else { throw OSMFeatureProviderError.invalidResponse }
 
@@ -319,7 +323,7 @@ public struct OSMFeatureProvider: Sendable {
                     highwayWays.append(HighwayWay(id: "way/\(id)", coordinates: coordinates, highway: highway,
                                                   expressway: tags["expressway"] == "yes"))
                 }
-                roads.append(RoadWay(highway: highway, names: localizedNames(tags), coordinates: coordinates))
+                roads.append(RoadWay(id: "way/\(id)", highway: highway, names: localizedNames(tags), coordinates: coordinates))
                 continue
             }
 
@@ -354,8 +358,13 @@ public struct OSMFeatureProvider: Sendable {
             }
         }
 
-        features += intersections(roads: roads, signals: signals, chunk: chunk, geometry: geometry, routeAware: routeAware)
-        return (features, highwayWays)
+        let intersections = intersections(roads: roads, signals: signals, chunk: chunk, geometry: geometry, routeAware: routeAware)
+        features += intersections.features
+        let namedRoads = intersections.routeRoads.compactMap { road -> NamedRoad? in
+            guard let name = road.names["default"] else { return nil }
+            return NamedRoad(id: road.id, name: name, highway: road.highway, coordinates: road.coordinates)
+        }
+        return (features, highwayWays, namedRoads)
     }
 
     private static func isBusStop(_ tags: [String: String]) -> Bool {
@@ -395,7 +404,8 @@ public struct OSMFeatureProvider: Sendable {
     /// trunk/primary/secondary cross street.
     /// Otherwise (naming a tapped point, no real route): any junction of two named roads, named "A & B".
     private static func intersections(roads inputRoads: [RoadWay], signals: Set<VertexKey>, chunk: RouteChunk,
-                                      geometry: RouteGeometry, routeAware: Bool) -> [StopFeature] {
+                                      geometry: RouteGeometry, routeAware: Bool)
+        -> (features: [StopFeature], routeRoads: [RoadWay]) {
         var roads = inputRoads
         let low = max(0, chunk.startChainage - 200)
         let high = min(geometry.totalLength, chunk.endChainage + 200)
@@ -452,7 +462,7 @@ public struct OSMFeatureProvider: Sendable {
                                       kind: isMajor ? .signalizedMajorIntersection : .minorIntersection,
                                       name: name, names: names))
         }
-        return result
+        return (result, roads.filter { $0.isRouteWay })
     }
 
     /// True if some segment of the way lies within 20 m of the route and runs within 30 degrees of it.

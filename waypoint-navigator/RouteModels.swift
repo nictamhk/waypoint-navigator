@@ -109,7 +109,7 @@ enum SavedRouteStore {
     }
 
     static func append(_ route: SavedRoute) throws {
-        let routes = try loadAll()
+        let routes = try loadAll().filter { $0.routeNumber.caseInsensitiveCompare(route.routeNumber) != .orderedSame }
         let updatedRoutes = routes + [route]
         let data = try JSONEncoder().encode(updatedRoutes)
         try data.write(to: fileURL, options: .atomic)

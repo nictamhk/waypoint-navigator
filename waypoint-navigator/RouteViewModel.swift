@@ -14,6 +14,8 @@ final class RouteViewModel {
     private(set) var saveMessage: String?
     private(set) var savedRoute: SavedRoute?
     private(set) var isRefreshingSavedRoute = false
+    private(set) var shouldOfferOSMRetry = false
+    private(set) var etaRetrySecondsRemaining: Int?
 
     /// Legs already fetched, so adding one waypoint only requests one new leg.
     private var legCache: [LegKey: DrivingLeg] = [:]
@@ -130,7 +132,9 @@ final class RouteViewModel {
     func setDefaultStart(at coordinate: CLLocationCoordinate2D) {
         guard !hasSetDefaultStart else { return }
         hasSetDefaultStart = true
-        waypoints.insert(MapWaypoint(coordinate: coordinate, title: "Current Location"), at: 0)
+        let start = MapWaypoint(coordinate: coordinate, title: "Current Location")
+        waypoints.insert(start, at: 0)
+        Task { await resolveWaypointName(id: start.id, fallback: "Stop 1") }
         errorMessage = nil
         saveMessage = nil
         savedRoute = nil
@@ -160,6 +164,57 @@ final class RouteViewModel {
     func suggestedStopName(at coordinate: CLLocationCoordinate2D) async -> String? {
         if let name = try? await osmFeatureProvider.stopName(near: GeoCoordinate(coordinate)) { return name }
         return await reverseGeocodedAddress(at: coordinate)
+    }
+
+    /// Suggests a route name from dominant roads, neighbourhood, destination, or route number.
+    func suggestedRouteName(routeNumber: String) async -> RouteNameSuggestion? {
+        guard let geometry = currentRouteGeometry() else { return nil }
+        let previousMessage = saveMessage
+        defer { saveMessage = previousMessage }
+        var road: (name: String, rule: RouteNameRule)?
+        var highwayFraction = 0.0
+        do {
+            saveMessage = "Looking up road names…"
+            let osm = try await osmFeatureProvider.features(for: geometry)
+            highwayFraction = StopPlacementService.highwayFraction(geometry: geometry, highwayWays: osm.highwayWays)
+            road = RouteNamer.roadName(from: RouteNamer.roadCoverage(geometry: geometry, roads: osm.roads))
+        } catch {
+            if Task.isCancelled { return nil }
+        }
+        guard !Task.isCancelled else { return nil }
+        var neighbourhood: String?
+        if road == nil { neighbourhood = await dominantNeighbourhood() }
+        guard !Task.isCancelled else { return nil }
+        var destinationName = waypoints.last?.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if destinationName == "Destination" { destinationName = nil }
+        return RouteNamer.finalize(road: road, neighbourhood: neighbourhood,
+                                   destinationName: destinationName, routeNumber: routeNumber,
+                                   highwayFraction: highwayFraction)
+    }
+
+    private func dominantNeighbourhood() async -> String? {
+        var tally = NeighbourhoodTally(totalStops: waypoints.count)
+        for (index, waypoint) in waypoints.enumerated() {
+            if tally.isDecided { break }
+            saveMessage = "Checking neighbourhoods (\(index + 1) of \(waypoints.count))…"
+            tally.add(await addressResolver.neighbourhood(at: waypoint.coordinate))
+            guard !Task.isCancelled else { return nil }
+        }
+        return tally.winner
+    }
+
+    private func currentRouteGeometry() -> RouteGeometry? {
+        var vertices: [GeoCoordinate] = []
+        for leg in legs {
+            for coordinate in Self.coordinates(in: leg.polyline) {
+                let point = GeoCoordinate(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                if let last = vertices.last, last.distance(to: point) < 1 { continue }
+                vertices.append(point)
+            }
+        }
+        guard vertices.count >= 2 else { return nil }
+        let geometry = RouteGeometry(vertices: vertices, legEndVertexIndices: [])
+        return geometry.totalLength > 0 ? geometry : nil
     }
 
     private func reverseGeocodedAddress(at coordinate: CLLocationCoordinate2D) async -> String? {
@@ -213,7 +268,8 @@ final class RouteViewModel {
                                 to destination: CLLocationCoordinate2D,
                                 destinationTitle: String?,
                                 stopInterval: CLLocationDistance,
-                                expressMode: Bool) async -> CLLocationDistance? {
+                                expressMode: Bool,
+                                useDefaultSpacingAfterOSMFailure: Bool = false) async -> CLLocationDistance? {
         guard stopInterval > 0 else {
             errorMessage = "Choose a stop interval greater than zero."
             return nil
@@ -246,6 +302,7 @@ final class RouteViewModel {
             guard geometry.totalLength > 0 else { throw RouteError.noRouteFound }
 
             saveMessage = "Loading nearby OSM stops and highway features…"
+            shouldOfferOSMRetry = false
             var features: [StopFeature] = []
             var highwayWays: [HighwayWay] = []
             var notes: [String] = []
@@ -260,6 +317,12 @@ final class RouteViewModel {
             } catch {
                 if Task.isCancelled { return nil }
                 onlineDataFailed = true
+                shouldOfferOSMRetry = true
+                guard useDefaultSpacingAfterOSMFailure else {
+                    errorMessage = "OSM stop data could not be fetched. Choose whether to retry or continue with default stop spacing."
+                    saveMessage = nil
+                    return nil
+                }
                 notes.append("Online place data was unavailable, so stops are placed at the interval and named from addresses.")
             }
             guard !Task.isCancelled else { return nil }
@@ -306,7 +369,7 @@ final class RouteViewModel {
     }
 
     /// Turns placed stops into waypoints.
-    /// - Origin keeps "Current Location"; the destination uses the given title, else an OSM/address name.
+    /// - Origin and destination use the same nearby-feature/address naming as other stops.
     /// - Feature names follow StopPlacementService's priority (bus stop, cross street, landmark, exit).
     /// - Unnamed stops are reverse-geocoded; if that fails they remain as "Stop X".
     /// - Finally titles are made unique (later duplicates get a km marker).
@@ -328,7 +391,9 @@ final class RouteViewModel {
             let coordinate = CLLocationCoordinate2D(latitude: stop.coordinate.latitude,
                                                     longitude: stop.coordinate.longitude)
             if index == 0 {
-                drafts.append(Draft(title: "Current Location", names: [:], coordinate: origin, chainage: stop.chainage))
+                let title = await suggestedStopName(at: origin) ?? "Stop 1"
+                guard !Task.isCancelled else { return nil }
+                drafts.append(Draft(title: title, names: [:], coordinate: origin, chainage: stop.chainage))
             } else if index == placed.count - 1 {
                 var title = destinationTitle
                 if title == nil { title = await suggestedStopName(at: destination) }
@@ -366,9 +431,10 @@ final class RouteViewModel {
         meters >= 1_000 ? String(format: "%.1f km", meters / 1_000) : "\(Int(meters.rounded())) m"
     }
 
-    func loadSavedRoute(_ route: SavedRoute) {
+    func loadSavedRoute(_ route: SavedRoute, reversed: Bool = false) {
         avoidHighwaysForCurrentRoute = false
-        waypoints = route.waypoints.map {
+        let savedWaypoints = reversed ? Array(route.waypoints.reversed()) : route.waypoints
+        waypoints = savedWaypoints.map {
             MapWaypoint(
                 id: $0.id,
                 coordinate: CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude),
@@ -381,7 +447,7 @@ final class RouteViewModel {
         legCache.removeAll()
         savedRoute = route
         errorMessage = nil
-        saveMessage = "Loaded route \(route.routeNumber). Refreshing ETAs…"
+        saveMessage = reversed ? "Loaded route \(route.routeNumber) in reverse. Recalculating driving legs and ETAs…" : "Loaded route \(route.routeNumber). Refreshing ETAs…"
         isRefreshingSavedRoute = true
         hasSetDefaultStart = true
     }
@@ -492,18 +558,35 @@ final class RouteViewModel {
         }
 
         for pair in missingPairs {
-            do {
-                let leg = try await fetchLeg(from: pair.0, to: pair.1)
-                guard generation == cacheGeneration else { return }
-                legCache[leg.key] = leg          // keep it even if we were cancelled meanwhile
-            } catch {
-                if Task.isCancelled { return }
-                errorMessage = message(for: error)
-                if isRefreshingSavedRoute {
-                    isRefreshingSavedRoute = false
-                    saveMessage = "Route loaded, but its ETAs could not be refreshed."
+            while true {
+                do {
+                    let leg = try await fetchLeg(from: pair.0, to: pair.1)
+                    guard generation == cacheGeneration else { return }
+                    legCache[leg.key] = leg
+                    etaRetrySecondsRemaining = nil
+                    break
+                } catch {
+                    if Task.isCancelled { return }
+                    guard isLoadingThrottled(error) else {
+                        errorMessage = message(for: error)
+                        if isRefreshingSavedRoute {
+                            isRefreshingSavedRoute = false
+                            saveMessage = "Route loaded, but its ETAs could not be refreshed."
+                        }
+                        return
+                    }
+                    errorMessage = "Apple Maps is temporarily throttling ETA requests. Retrying automatically in 60 seconds."
+                    for seconds in stride(from: 60, through: 1, by: -1) {
+                        guard generation == cacheGeneration, !Task.isCancelled else {
+                            etaRetrySecondsRemaining = nil
+                            return
+                        }
+                        etaRetrySecondsRemaining = seconds
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
+                    etaRetrySecondsRemaining = nil
+                    errorMessage = nil
                 }
-                return
             }
             if Task.isCancelled { return }
         }
@@ -547,7 +630,7 @@ final class RouteViewModel {
         if let mapError = error as? MKError {
             switch mapError.code {
             case .loadingThrottled:
-                return "Apple Maps is busy. Wait a few seconds, then tap Retry."
+                return "Apple Maps is temporarily throttling ETA requests."
             case .directionsNotFound:
                 return "No driving route found for one leg. Try moving a waypoint closer to a road."
             default:
@@ -555,6 +638,10 @@ final class RouteViewModel {
             }
         }
         return "Could not calculate the route: \(error.localizedDescription)"
+    }
+
+    private func isLoadingThrottled(_ error: Error) -> Bool {
+        (error as? MKError)?.code == .loadingThrottled
     }
 }
 

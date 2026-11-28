@@ -1,6 +1,7 @@
 import SwiftUI
 import MapKit
 import UIKit
+import NavigationCore
 
 struct WaypointMapView: View {
     @State private var locationManager = LocationManager()
@@ -9,6 +10,7 @@ struct WaypointMapView: View {
     @State private var hasCentredOnUser = false
     @State private var isEditingWaypoints = false
     @State private var isShowingSaveForm = false
+    @State private var isGeneratingRouteName = false
     @State private var isConfirmingRouteOverwrite = false
     @State private var pendingRouteOverwriteNumber = ""
     @State private var routeNumberDigits = ""
@@ -22,6 +24,7 @@ struct WaypointMapView: View {
     @State private var isShowingRouteLibrary = false
     @State private var savedRoutes: [SavedRoute] = []
     @State private var selectedPresetID: UUID?
+    @State private var isPresetChooserExpanded = true
     @State private var presetError: String?
     @State private var presetSearchText = ""
     @State private var automaticDestination: MapWaypoint?
@@ -31,6 +34,7 @@ struct WaypointMapView: View {
     @State private var isExpressModeEnabled = false
     @State private var isShowingExpressHelp = false
     @State private var isGeneratingRoute = false
+    @State private var isShowingOSMFailureAlert = false
     @State private var hasGeneratedAutomaticRoute = false
     @State private var areAutomaticControlsExpanded = true
     @State private var automaticRouteTask: Task<Void, Never>?
@@ -91,10 +95,18 @@ struct WaypointMapView: View {
         .task(id: routeViewModel.routeTaskID) { await routeViewModel.updateRoute() }
         .onChange(of: locationManager.hasFix) { _, hasFix in centreOnUserOnce(hasFix: hasFix) }
         .sheet(isPresented: $isShowingSaveForm) { saveRouteForm }
+        .alert("OSM Data Unavailable", isPresented: $isShowingOSMFailureAlert) {
+            Button("Retry OSM Fetch") { generateAutomaticRoute() }
+            Button("Use Default Stop Spacing") { generateAutomaticRoute(useDefaultSpacingAfterOSMFailure: true) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("OpenStreetMap stop data could not be fetched. You can retry, or continue with evenly spaced stops and address-based names.")
+        }
         .fullScreenCover(isPresented: $isShowingRouteLibrary, onDismiss: { refreshSavedRoutes() }) {
-            RouteLibraryView { route in
-                routeViewModel.loadSavedRoute(route)
+            RouteLibraryView { route, reversed in
+                routeViewModel.loadSavedRoute(route, reversed: reversed)
                 selectedPresetID = route.id
+                isPresetChooserExpanded = false
                 automaticDestination = nil
                 focusMap(on: route)
             }
@@ -126,6 +138,7 @@ struct WaypointMapView: View {
                 cameraPosition = .region(neighborhoodRegion(center: coordinate))
             }
             if mode == .loadPreset { refreshSavedRoutes() }
+            isPresetChooserExpanded = true
         }
         .onChange(of: routeViewModel.savedRoute?.id) { _, _ in refreshSavedRoutes() }
     }
@@ -183,6 +196,7 @@ struct WaypointMapView: View {
                 MapCompass()
             }
             .onTapGesture { screenPoint in
+                guard !(routeCreationMode == .automatic && hasGeneratedAutomaticRoute) else { return }
                 handleMapTap(at: screenPoint, using: mapProxy)
             }
             .onMapCameraChange(frequency: .onEnd) { context in
@@ -374,6 +388,9 @@ struct WaypointMapView: View {
                 if routeCreationMode == .automatic && hasGeneratedAutomaticRoute {
                     return areAutomaticControlsExpanded ? 400 : 130
                 }
+                if routeCreationMode == .loadPreset && routeViewModel.savedRoute != nil {
+                    return isPresetChooserExpanded ? 400 : 150
+                }
                 if routeCreationMode == .manual { return 240 }
                 return 400
             }()
@@ -405,7 +422,9 @@ struct WaypointMapView: View {
                     statusPanel(waypoints: waypoints)
                 }
                 if routeCreationMode != .automatic && (routeCreationMode != .loadPreset || routeViewModel.savedRoute != nil) || hasGeneratedAutomaticRoute {
-                    let availableListHeight = isCompact ? 110 : max(110, geometry.size.height - reservedHeight)
+                    // The list should consume the same remaining card height when the map is
+                    // expanded; compact mode only hides the status panel, it does not shrink the list.
+                    let availableListHeight = max(110, geometry.size.height - reservedHeight)
                     waypointPanel(waypoints: waypoints, listHeight: availableListHeight)
                         .frame(maxHeight: .infinity, alignment: .top)
                 }
@@ -442,20 +461,27 @@ struct WaypointMapView: View {
                 }
             }
 
-            Text("Stop Interval")
+            Text("Minimum Stop Interval")
                 .font(.headline)
             HStack(spacing: 8) {
                 ForEach([200.0, 300.0, 500.0, 1_000.0], id: \.self) { interval in
-                    Button {
+                    // Precompute values to simplify type-checking
+                    let isSelected = (Double(stopIntervalInput) == interval)
+                    let labelText: String = {
+                        if interval == 1_000.0 { return "1 000 m" }
+                        return "\(Int(interval)) m"
+                    }()
+
+                    Button(action: {
                         stopIntervalMeters = interval
                         stopIntervalInput = formattedStopInterval(interval)
-                    } label: {
-                        Text(interval == 1_000 ? "1 000 m" : "\(Int(interval)) m")
+                    }) {
+                        Text(labelText)
                             .font(.caption.weight(.semibold))
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .tint(Double(stopIntervalInput) == interval ? .accentColor : .secondary)
+                    .tint(isSelected ? .accentColor : .secondary)
                 }
             }
             HStack(spacing: 10) {
@@ -481,7 +507,7 @@ struct WaypointMapView: View {
             }
 
             HStack(spacing: 10) {
-                Toggle("Express Mode", isOn: $isExpressModeEnabled)
+                Toggle("Expressway Usage", isOn: $isExpressModeEnabled)
                     .toggleStyle(.switch)
                 Button { isShowingExpressHelp = true } label: {
                     Image(systemName: "questionmark.circle")
@@ -492,10 +518,10 @@ struct WaypointMapView: View {
                 Spacer()
             }
 
-            Button(action: generateAutomaticRoute) {
+            Button(action: { generateAutomaticRoute() }) {
                 HStack {
                     Spacer()
-                    Text("Generate route")
+                    Text("Generate Route")
                     Spacer()
                 }
             }
@@ -533,14 +559,39 @@ struct WaypointMapView: View {
     private var presetRoutePanel: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Choose a saved route")
-                    .font(.subheadline.weight(.medium))
+                if routeViewModel.savedRoute != nil {
+                    Button {
+                        withAnimation { isPresetChooserExpanded.toggle() }
+                    } label: {
+                        Label("Choose a saved route", systemImage: isPresetChooserExpanded ? "chevron.up" : "chevron.down")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Text("Choose a saved route")
+                        .font(.subheadline.weight(.medium))
+                }
                 Spacer()
                 Button("Route Library") { isShowingRouteLibrary = true }
                     .font(.subheadline.weight(.semibold))
             }
 
-            if let presetError {
+            if routeViewModel.savedRoute != nil && !isPresetChooserExpanded {
+                if let route = routeViewModel.savedRoute {
+                    HStack(spacing: 10) {
+                        Text(route.routeNumber.isEmpty ? "—" : route.routeNumber)
+                            .font(.headline.bold())
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(route.color.swiftUIColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(route.color.swiftUIColor, lineWidth: 2))
+                        Text(route.name)
+                            .font(.subheadline.bold())
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                }
+            } else if let presetError {
                 Text(presetError)
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -593,6 +644,7 @@ struct WaypointMapView: View {
                         guard let selectedPresetID,
                               let route = savedRoutes.first(where: { $0.id == selectedPresetID }) else { return }
                         routeViewModel.loadSavedRoute(route)
+                        isPresetChooserExpanded = false
                         focusMap(on: route)
                     } label: {
                         Label("Load Selected Route", systemImage: "arrow.down.to.line")
@@ -685,7 +737,7 @@ struct WaypointMapView: View {
         }
     }
 
-    private func generateAutomaticRoute() {
+    private func generateAutomaticRoute(useDefaultSpacingAfterOSMFailure: Bool = false) {
         guard let origin = locationManager.userCoordinate,
               let destination = automaticDestination,
               let requestedInterval = Double(stopIntervalInput), requestedInterval > 0 else { return }
@@ -699,7 +751,8 @@ struct WaypointMapView: View {
                 to: destination.coordinate,
                 destinationTitle: destination.title,
                 stopInterval: requestedInterval,
-                expressMode: expressMode
+                expressMode: expressMode,
+                useDefaultSpacingAfterOSMFailure: useDefaultSpacingAfterOSMFailure
             )
             guard automaticGenerationID == generationID else { return }
             if let effectiveInterval {
@@ -707,6 +760,9 @@ struct WaypointMapView: View {
                 stopIntervalInput = formattedStopInterval(effectiveInterval)
                 hasGeneratedAutomaticRoute = true
                 areAutomaticControlsExpanded = false
+                focusMap(onWaypoints: routeViewModel.waypoints)
+            } else if routeViewModel.shouldOfferOSMRetry {
+                isShowingOSMFailureAlert = true
             }
             isGeneratingRoute = false
             automaticRouteTask = nil
@@ -894,11 +950,29 @@ struct WaypointMapView: View {
                             selectedRouteColor = savedRoute.color.swiftUIColor
                         }
                         isShowingSaveForm = true
+                        if routeViewModel.savedRoute == nil {
+                            let initialName = routeNameInput
+                            Task {
+                                guard let suggestion = await routeViewModel.suggestedRouteName(routeNumber: routeNumber),
+                                      routeNameInput == initialName else { return }
+                                routeNameInput = suggestion.name.uppercased()
+                            }
+                        }
                     } label: {
                         Label("Save", systemImage: "square.and.arrow.down")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!routeViewModel.hasCompleteRoute)
+
+                    if routeCreationMode == .loadPreset, let savedRoute = routeViewModel.savedRoute {
+                        Button {
+                            routeViewModel.loadSavedRoute(savedRoute, reversed: true)
+                            focusMap(onWaypoints: routeViewModel.waypoints)
+                        } label: {
+                            Label("Reverse", systemImage: "arrow.left.arrow.right")
+                        }
+                        .buttonStyle(.bordered)
+                    }
 
                     Button("Clear", role: .destructive) {
                         routeViewModel.resetDraft(defaultStart: locationManager.userCoordinate)
@@ -910,7 +984,21 @@ struct WaypointMapView: View {
                     .buttonStyle(.bordered)
                 }
                 .padding(.horizontal)
-                .padding(.vertical, 9)
+                .padding(.top, 8)
+                .padding(.bottom, 20)
+
+                if routeCreationMode == .automatic && routeViewModel.shouldOfferOSMRetry {
+                    Button {
+                        generateAutomaticRoute()
+                    } label: {
+                        Label("Retry loading stop data", systemImage: "arrow.clockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isGeneratingRoute)
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+                }
 
                 if let message = routeViewModel.saveMessage {
                     Text(message)
@@ -926,6 +1014,18 @@ struct WaypointMapView: View {
                 errorBanner(message)
                     .padding(.horizontal)
                     .padding(.vertical, 6)
+            }
+            if let seconds = routeViewModel.etaRetrySecondsRemaining {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Retrying ETA calculations in \(seconds) seconds…")
+                        .font(.caption.weight(.medium))
+                        .monospacedDigit()
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .accessibilityElement(children: .combine)
             }
             if locationManager.isDenied {
                 permissionDeniedBanner
@@ -1001,6 +1101,17 @@ struct WaypointMapView: View {
         cameraPosition = .region(MKCoordinateRegion(center: coordinate, latitudinalMeters: 700, longitudinalMeters: 700))
     }
 
+    private func focusMap(onWaypoints waypoints: [MapWaypoint]) {
+        guard !waypoints.isEmpty else { return }
+        var rect = MKMapRect.null
+        for waypoint in waypoints {
+            let point = MKMapPoint(routeViewModel.displayedCoordinate(for: waypoint))
+            rect = rect.union(MKMapRect(x: point.x, y: point.y, width: 0, height: 0))
+        }
+        let padded = rect.insetBy(dx: -max(rect.width * 0.15, 500), dy: -max(rect.height * 0.2, 500))
+        cameraPosition = .rect(padded)
+    }
+
     private func waypointTitle(at index: Int, count: Int) -> String {
         if index == 0 { return "Start" }
         if index == count - 1 { return "Terminus" }
@@ -1010,8 +1121,8 @@ struct WaypointMapView: View {
     private var saveRouteForm: some View {
         NavigationStack {
             Form {
-                Section("Route details") {
-                    TextField("Route number", text: $routeNumberDigits)
+                Section("Route Number") {
+                    TextField("Number", text: $routeNumberDigits)
                         .keyboardType(.numberPad)
                         .focused($isRouteNumberFocused)
                         .onChange(of: routeNumberDigits) { _, value in
@@ -1019,9 +1130,9 @@ struct WaypointMapView: View {
                             if digitsOnly != value { routeNumberDigits = digitsOnly }
                         }
 
-                    Toggle("Add alphabet prefix", isOn: $includesRoutePrefix)
+                    Toggle("Add prefix", isOn: $includesRoutePrefix)
                     if includesRoutePrefix {
-                        TextField("Prefix", text: $routeNumberPrefix)
+                        TextField("Prefix letters", text: $routeNumberPrefix)
                             .textInputAutocapitalization(.characters)
                             .autocorrectionDisabled()
                             .onChange(of: routeNumberPrefix) { _, value in
@@ -1030,9 +1141,9 @@ struct WaypointMapView: View {
                             }
                     }
 
-                    Toggle("Add alphabet suffix", isOn: $includesRouteSuffix)
+                    Toggle("Add suffix", isOn: $includesRouteSuffix)
                     if includesRouteSuffix {
-                        TextField("Suffix", text: $routeNumberSuffix)
+                        TextField("Suffix letters", text: $routeNumberSuffix)
                             .textInputAutocapitalization(.characters)
                             .autocorrectionDisabled()
                             .onChange(of: routeNumberSuffix) { _, value in
@@ -1042,8 +1153,24 @@ struct WaypointMapView: View {
                     }
 
                     LabeledContent("Complete route number", value: completeRouteNumber.isEmpty ? "—" : completeRouteNumber)
-                    TextField("Route name", text: $routeNameInput)
+                }
+
+                Section("Route Name") {
+                    TextField("Name", text: $routeNameInput)
                         .textInputAutocapitalization(.words)
+                    Button {
+                        generateRouteNameSuggestion()
+                    } label: {
+                        if isGeneratingRouteName {
+                            Label("Generating…", systemImage: "hourglass")
+                        } else {
+                            Label("Generate Route Name", systemImage: "sparkles")
+                        }
+                    }
+                    .disabled(isGeneratingRouteName || routeViewModel.waypoints.count < 2)
+                }
+
+                Section("Route Colour") {
                     ColorPicker("Route colour", selection: $selectedRouteColor, supportsOpacity: false)
                 }
 
@@ -1053,7 +1180,7 @@ struct WaypointMapView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Save Route")
+            .navigationTitle("Save Line")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -1073,6 +1200,11 @@ struct WaypointMapView: View {
             }
         }
         .presentationDetents([.medium])
+        .onAppear {
+            if routeNumberDigits.isEmpty {
+                configureRouteNumberFields(from: suggestedRouteNumber())
+            }
+        }
         .alert("Overwrite saved route?", isPresented: $isConfirmingRouteOverwrite) {
             Button("Cancel", role: .cancel) { }
             Button("Overwrite", role: .destructive) {
@@ -1092,23 +1224,28 @@ struct WaypointMapView: View {
     }
 
     private var completeRouteNumber: String {
+        compileRouteNumber()
+    }
+
+    private func compileRouteNumber() -> String {
         let prefix = includesRoutePrefix ? String(routeNumberPrefix.filter(\.isLetter)).uppercased() : ""
-        let digits = String(routeNumberDigits.filter(\.isNumber))
+        let number = String(routeNumberDigits.filter(\.isNumber))
         let suffix = includesRouteSuffix ? String(routeNumberSuffix.filter(\.isLetter)).uppercased() : ""
-        return prefix + digits + suffix
+        return prefix + number + suffix
     }
 
     private func saveRouteWithOverwriteCheck() {
-        pendingRouteOverwriteNumber = completeRouteNumber
+        pendingRouteOverwriteNumber = compileRouteNumber()
         let duplicateExists = ((try? SavedRouteStore.loadAll()) ?? []).contains {
-            $0.routeNumber.caseInsensitiveCompare(completeRouteNumber) == .orderedSame && $0.id != routeViewModel.savedRoute?.id
+            $0.routeNumber.caseInsensitiveCompare(pendingRouteOverwriteNumber) == .orderedSame
         }
         if duplicateExists { isConfirmingRouteOverwrite = true }
         else { persistRoute() }
     }
 
     private func persistRoute() {
-        routeViewModel.saveRoute(routeNumber: completeRouteNumber, name: routeNameInput, color: savedRouteColor(from: selectedRouteColor))
+        routeViewModel.saveRoute(routeNumber: pendingRouteOverwriteNumber.isEmpty ? compileRouteNumber() : pendingRouteOverwriteNumber,
+                                 name: routeNameInput, color: savedRouteColor(from: selectedRouteColor))
         isShowingSaveForm = false
     }
 
@@ -1125,6 +1262,16 @@ struct WaypointMapView: View {
         }
         includesRoutePrefix = !routeNumberPrefix.isEmpty
         includesRouteSuffix = !routeNumberSuffix.isEmpty
+    }
+
+    private func generateRouteNameSuggestion() {
+        guard !completeRouteNumber.isEmpty else { return }
+        isGeneratingRouteName = true
+        Task {
+            defer { isGeneratingRouteName = false }
+            guard let suggestion = await routeViewModel.suggestedRouteName(routeNumber: completeRouteNumber) else { return }
+            routeNameInput = suggestion.name.uppercased()
+        }
     }
 
     private func suggestedRouteName(number: String) -> String {

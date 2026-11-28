@@ -1,14 +1,18 @@
 import SwiftUI
+import MapKit
 
 struct RouteLibraryView: View {
     @Environment(\.dismiss) private var dismiss
-    let onLoad: (SavedRoute) -> Void
+    let onLoad: (SavedRoute, Bool) -> Void
 
     @State private var routes: [SavedRoute] = []
     @State private var loadError: String?
     @State private var deleteError: String?
     @State private var routePendingDeletion: SavedRoute?
     @State private var isConfirmingDelete = false
+    @State private var libraryDisplay: LibraryDisplay = .list
+    @State private var mapCamera: MapCameraPosition = .automatic
+    @State private var selectedMapRouteID: UUID?
 
     var body: some View {
         NavigationStack {
@@ -18,25 +22,41 @@ struct RouteLibraryView: View {
                 } else if routes.isEmpty {
                     ContentUnavailableView("No saved routes", systemImage: "point.topleft.down.to.point.bottomright.curvepath", description: Text("Routes you save will appear here."))
                 } else {
-                    ScrollView {
-                        LazyVStack(spacing: 12) {
-                            if let deleteError {
-                                Text(deleteError)
-                                    .font(.caption)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            ForEach(routes) { route in
-                                SavedRouteCard(route: route) {
-                                    onLoad(route)
-                                    dismiss()
-                                } onDelete: {
-                                    routePendingDeletion = route
-                                    isConfirmingDelete = true
+                    VStack(spacing: 0) {
+                        Picker("Library display", selection: $libraryDisplay) {
+                            Text("List").tag(LibraryDisplay.list)
+                            Text("Map").tag(LibraryDisplay.map)
+                        }
+                        .pickerStyle(.segmented)
+                        .padding(.horizontal)
+                        .padding(.top, 8)
+                        if libraryDisplay == .map {
+                            routeMap
+                        } else {
+                            ScrollView {
+                                LazyVStack(spacing: 12) {
+                                    if let deleteError {
+                                        Text(deleteError)
+                                            .font(.caption)
+                                            .foregroundStyle(.red)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    ForEach(routes) { route in
+                                        SavedRouteCard(route: route) {
+                                            onLoad(route, false)
+                                            dismiss()
+                                        } onReverse: {
+                                            onLoad(route, true)
+                                            dismiss()
+                                        } onDelete: {
+                                            routePendingDeletion = route
+                                            isConfirmingDelete = true
+                                        }
+                                    }
                                 }
+                                .padding()
                             }
                         }
-                        .padding()
                     }
                 }
             }
@@ -54,6 +74,71 @@ struct RouteLibraryView: View {
                 Text("Delete route \(route.routeNumber), \(route.name)? This cannot be undone.")
             }
             .task { reloadRoutes() }
+        }
+    }
+
+    private var routeMap: some View {
+        Map(position: $mapCamera) {
+            ForEach(routes.filter { $0.polyline.count >= 2 }) { route in
+                let coordinates = route.polyline.map {
+                    CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
+                }
+                MapPolyline(coordinates: coordinates)
+                    .stroke(route.color.swiftUIColor, lineWidth: 5)
+                if let middle = coordinates.dropFirst(max(0, (coordinates.count - 1) / 2)).first {
+                    Annotation(route.routeNumber, coordinate: middle, anchor: .center) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    selectedMapRouteID = selectedMapRouteID == route.id ? nil : route.id
+                                }
+                            } label: {
+                                Text(route.routeNumber.isEmpty ? "—" : route.routeNumber)
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(route.color.swiftUIColor, in: RoundedRectangle(cornerRadius: 5))
+                                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(.white, lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+
+                            if selectedMapRouteID == route.id {
+                                VStack(alignment: .leading, spacing: 7) {
+                                    Text(route.name)
+                                        .font(.subheadline.bold())
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    HStack(spacing: 8) {
+                                        Button("Load") {
+                                            onLoad(route, false)
+                                            dismiss()
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        Button("Reverse") {
+                                            onLoad(route, true)
+                                            dismiss()
+                                        }
+                                        .buttonStyle(.bordered)
+                                    }
+                                }
+                                .padding(9)
+                                .frame(maxWidth: 210, alignment: .leading)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
+                                .overlay(RoundedRectangle(cornerRadius: 9).stroke(route.color.swiftUIColor, lineWidth: 1.5))
+                                .shadow(radius: 4)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .mapControls { MapCompass(); MapScaleView() }
+        .overlay(alignment: .topLeading) {
+            if let deleteError {
+                Text(deleteError).font(.caption).foregroundStyle(.red)
+                    .padding(8).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)).padding(8)
+            }
         }
     }
 
@@ -79,9 +164,12 @@ struct RouteLibraryView: View {
 
 }
 
+private enum LibraryDisplay { case list, map }
+
 struct SavedRouteCard: View {
     let route: SavedRoute
     let onLoad: () -> Void
+    let onReverse: () -> Void
     let onDelete: () -> Void
 
     private var totalTravelTime: TimeInterval {
@@ -129,6 +217,8 @@ struct SavedRouteCard: View {
                 Spacer()
                 Button("Load route", action: onLoad)
                     .buttonStyle(.borderedProminent)
+                Button("Load in reverse", action: onReverse)
+                    .buttonStyle(.bordered)
             }
         }
         .padding(12)
